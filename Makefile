@@ -107,9 +107,9 @@ run-bucket: manifests generate fmt vet ## Run a controller from your host.
 	go run ./ori/bucket/cmd/bucket/main.go
 
 .PHONY: docker-build
-docker-build: test ## Build docker image with the manager.
-	docker build --target cephlet-volume -t ${CEPHLET_VOLUME_IMG} .
-	docker build --target cephlet-bucket -t ${CEPHLET_BUCKET_IMG} .
+docker-build: ## Build docker image with the manager.
+	docker build --platform=linux/amd64 --target cephlet-volume -t ${CEPHLET_VOLUME_IMG} . --load
+	docker build --platform=linux/amd64 --target cephlet-bucket -t ${CEPHLET_BUCKET_IMG} . --load
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

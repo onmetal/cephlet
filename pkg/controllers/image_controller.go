@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ceph/go-ceph/rados"
 	librbd "github.com/ceph/go-ceph/rbd"
@@ -232,10 +233,32 @@ func (r *ImageReconciler) deleteImage(ctx context.Context, log logr.Logger, ioCt
 		return nil
 	}
 
-	if err := librbd.RemoveImage(ioCtx, ImageIDToRBDID(image.ID)); err != nil && !errors.Is(err, librbd.ErrNotFound) {
+	img, err := librbd.OpenImage(ioCtx, ImageIDToRBDID(image.ID), librbd.NoSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to open image: %w", err)
+	}
+	defer img.Close()
+
+	data, err := json.Marshal(image)
+	if err != nil {
+		return fmt.Errorf("failed to marshal image obj: %w", err)
+	}
+
+	err = img.SetMetadata("onmetal-omap-backup", string(data))
+	if err != nil {
+		return err
+	}
+
+	// TODO make trash timeout configurable
+	if err := img.Trash(7 * 24 * time.Hour); err != nil && !errors.Is(err, librbd.ErrNotFound) {
 		return fmt.Errorf("failed to remove rbd image: %w", err)
 	}
-	log.V(2).Info("Rbd image deleted")
+	log.V(2).Info("Rbd image marked for deletion")
+
+	//if err := librbd.RemoveImage(ioCtx, ImageIDToRBDID(image.ID)); err != nil && !errors.Is(err, librbd.ErrNotFound) {
+	//	return fmt.Errorf("failed to remove rbd image: %w", err)
+	//}
+	//log.V(2).Info("Rbd image deleted")
 
 	image.Finalizers = utils.DeleteSliceElement(image.Finalizers, ImageFinalizer)
 	if _, err := r.images.Update(ctx, image); store.IgnoreErrNotFound(err) != nil {

@@ -108,6 +108,7 @@ for val in ${list[@]}; do
   MONITOR=$(echo "$MONITOR" | sed 's/,//g')
   MONITOR=$(echo "$MONITOR" | sed 's/ /, /g')
   MONITOR=$(echo "$MONITOR" | sed 's/"//g; s/"//g')
+  MONITOR=$(echo "$MONITOR" | sed 's/ //g')
 
   SIZE=`cat vol-$val.json | jq '.spec.resources.storage'`
   SIZE=$( echo "$SIZE" | sed 's/Gi/1073741824/g' | bc )

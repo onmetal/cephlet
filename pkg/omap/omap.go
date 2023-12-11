@@ -190,7 +190,7 @@ func (s *Store[E]) Delete(ctx context.Context, id string) error {
 		return s.delete(ioCtx, id)
 	}
 
-	now := time.Now()
+	now := time.Now().AddDate(0, 0, 7)
 	obj.SetDeletedAt(&now)
 
 	if _, err := s.set(ioCtx, obj); err != nil {

@@ -3,7 +3,7 @@ module github.com/onmetal/cephlet
 go 1.20
 
 require (
-	github.com/ceph/go-ceph v0.21.0
+	github.com/ceph/go-ceph v0.24.0
 	github.com/containerd/containerd v1.6.16
 	github.com/go-logr/logr v1.2.4
 	github.com/google/addlicense v1.1.1
@@ -128,7 +128,7 @@ require (
 	golang.org/x/net v0.10.0 // indirect
 	golang.org/x/oauth2 v0.7.0 // indirect
 	golang.org/x/sync v0.2.0 // indirect
-	golang.org/x/sys v0.8.0 // indirect
+	golang.org/x/sys v0.12.0 // indirect
 	golang.org/x/term v0.8.0 // indirect
 	golang.org/x/text v0.9.0 // indirect
 	golang.org/x/time v0.3.0 // indirect

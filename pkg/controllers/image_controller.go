@@ -367,6 +367,7 @@ func (r *ImageReconciler) updateImage(ctx context.Context, log logr.Logger, ioCt
 	if err != nil {
 		return fmt.Errorf("failed to open image: %w", err)
 	}
+	defer img.Close()
 
 	currentSize, err := img.GetSize()
 	if err != nil {

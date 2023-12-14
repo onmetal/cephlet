@@ -206,7 +206,6 @@ func (s *Store[E]) Delete(ctx context.Context, id string) error {
 }
 
 func (s *Store[E]) delete(ioCtx *rados.IOContext, id string) error {
-	defer ioCtx.Destroy()
 	if err := s.deleteOmapValue(ioCtx, s.omapName, id); err != nil {
 		return fmt.Errorf("failed to delete object from omap: %w", err)
 	}

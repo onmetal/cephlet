@@ -242,7 +242,9 @@ func (r *ImageReconciler) deleteImage(ctx context.Context, log logr.Logger, ioCt
 			imgExists = false
 		}
 	}
-	defer img.Close()
+	if img != nil {
+		defer img.Close()
+	}
 
 	if imgExists {
 		data, err := json.Marshal(image)

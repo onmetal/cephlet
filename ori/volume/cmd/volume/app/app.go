@@ -66,6 +66,8 @@ type CephOptions struct {
 	PopulatorBufferSize int64
 
 	KeyEncryptionKeyPath string
+
+	TrashRetention int64
 }
 
 func (o *Options) Defaults() {
@@ -73,6 +75,7 @@ func (o *Options) Defaults() {
 	o.Ceph.BurstFactor = 10
 	o.Ceph.BurstDurationInSeconds = 15
 	o.Ceph.PopulatorBufferSize = 5 * 1024 * 1024
+	o.Ceph.TrashRetention = 7
 }
 
 func (o *Options) AddFlags(fs *pflag.FlagSet) {
@@ -84,6 +87,8 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.Int64Var(&o.Ceph.BurstDurationInSeconds, "limits-burst-duration", o.Ceph.BurstDurationInSeconds, "Defines the burst duration in seconds.")
 
 	fs.Int64Var(&o.Ceph.PopulatorBufferSize, "populator-buffer-size", o.Ceph.PopulatorBufferSize, "Defines the buffer size (in bytes) which is used for downloading a image.")
+
+	fs.Int64Var(&o.Ceph.TrashRetention, "trash-retention", o.Ceph.TrashRetention, "Defines the days that an image should be kept in trash before being entirely deleted.")
 
 	fs.StringVar(&o.Ceph.Monitors, "ceph-monitors", o.Ceph.Monitors, "Ceph Monitors to connect to.")
 	fs.DurationVar(&o.Ceph.ConnectTimeout, "ceph-connect-timeout", o.Ceph.ConnectTimeout, "Connect timeout for establishing a connection to ceph.")
@@ -254,9 +259,10 @@ func Run(ctx context.Context, opts Options) error {
 		snapshotEvents,
 		encryptor,
 		controllers.ImageReconcilerOptions{
-			Monitors: opts.Ceph.Monitors,
-			Client:   opts.Ceph.Client,
-			Pool:     opts.Ceph.Pool,
+			Monitors:       opts.Ceph.Monitors,
+			Client:         opts.Ceph.Client,
+			Pool:           opts.Ceph.Pool,
+			TrashRetention: opts.Ceph.TrashRetention,
 		},
 	)
 	if err != nil {

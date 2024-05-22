@@ -48,9 +48,10 @@ const (
 )
 
 type ImageReconcilerOptions struct {
-	Monitors string
-	Client   string
-	Pool     string
+	Monitors       string
+	Client         string
+	Pool           string
+	TrashRetention int64
 }
 
 func NewImageReconciler(
@@ -104,6 +105,10 @@ func NewImageReconciler(
 		return nil, fmt.Errorf("must specify ceph client")
 	}
 
+	if opts.TrashRetention == 0 {
+		opts.TrashRetention = 7
+	}
+
 	return &ImageReconciler{
 		log:            log,
 		conn:           conn,
@@ -117,6 +122,7 @@ func NewImageReconciler(
 		monitors:       opts.Monitors,
 		client:         opts.Client,
 		pool:           opts.Pool,
+		trashRetention: opts.TrashRetention,
 		keyEncryption:  keyEncryption,
 	}, nil
 }
@@ -136,9 +142,10 @@ type ImageReconciler struct {
 	imageEvents    event.Source[*api.Image]
 	snapshotEvents event.Source[*api.Snapshot]
 
-	monitors string
-	client   string
-	pool     string
+	monitors       string
+	client         string
+	pool           string
+	trashRetention int64
 
 	keyEncryption encryption.Encryptor
 }
@@ -148,6 +155,8 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 
 	//todo make configurable
 	workerSize := 15
+
+	log.Info("Starting ImageReconciler", "workerSize", workerSize, "trashRetention", r.trashRetention)
 
 	imgEventReg, err := r.imageEvents.AddHandler(event.HandlerFunc[*api.Image](func(evt event.Event[*api.Image]) {
 		r.queue.Add(evt.Object.ID)
@@ -257,8 +266,7 @@ func (r *ImageReconciler) deleteImage(ctx context.Context, log logr.Logger, ioCt
 			return err
 		}
 
-		// TODO make trash timeout configurable
-		if err := img.Trash(7 * 24 * time.Hour); err != nil && !errors.Is(err, librbd.ErrNotFound) {
+		if err := img.Trash(time.Duration(r.trashRetention) * 24 * time.Hour); err != nil && !errors.Is(err, librbd.ErrNotFound) {
 			return fmt.Errorf("failed to remove rbd image: %w", err)
 		}
 		log.V(2).Info("Rbd image marked for deletion")

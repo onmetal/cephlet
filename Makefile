@@ -108,13 +108,13 @@ run-bucket: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	docker build --platform=linux/amd64 --target cephlet-volume -t ${CEPHLET_VOLUME_IMG} . --load
-	docker build --platform=linux/amd64 --target cephlet-bucket -t ${CEPHLET_BUCKET_IMG} . --load
+	podman build --platform=linux/amd64 --target cephlet-volume -t ${CEPHLET_VOLUME_IMG} .
+	podman build --platform=linux/amd64 --target cephlet-bucket -t ${CEPHLET_BUCKET_IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
-	docker push ${CEPHLET_VOLUME_IMG}
-	docker push ${CEPHLET_BUCKET_IMG}
+	podman push ${CEPHLET_VOLUME_IMG}
+	podman push ${CEPHLET_BUCKET_IMG}
 
 ##@ Deployment
 

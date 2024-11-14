@@ -23,6 +23,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onmetal/onmetal-api/broker/common"
+	ori "github.com/onmetal/onmetal-api/ori/apis/volume/v1alpha1"
+	"github.com/onmetal/onmetal-image/oci/remote"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"google.golang.org/grpc"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
 	"github.com/onmetal/cephlet/ori/volume/server"
 	"github.com/onmetal/cephlet/pkg/api"
 	"github.com/onmetal/cephlet/pkg/ceph"
@@ -32,14 +41,6 @@ import (
 	"github.com/onmetal/cephlet/pkg/omap"
 	"github.com/onmetal/cephlet/pkg/utils"
 	"github.com/onmetal/cephlet/pkg/vcr"
-	"github.com/onmetal/onmetal-api/broker/common"
-	ori "github.com/onmetal/onmetal-api/ori/apis/volume/v1alpha1"
-	"github.com/onmetal/onmetal-image/oci/remote"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	"google.golang.org/grpc"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 type Options struct {
@@ -68,6 +69,8 @@ type CephOptions struct {
 	KeyEncryptionKeyPath string
 
 	TrashRetention int64
+
+	WorkerSize int
 }
 
 func (o *Options) Defaults() {
@@ -76,6 +79,7 @@ func (o *Options) Defaults() {
 	o.Ceph.BurstDurationInSeconds = 15
 	o.Ceph.PopulatorBufferSize = 5 * 1024 * 1024
 	o.Ceph.TrashRetention = 7
+	o.Ceph.WorkerSize = 64
 }
 
 func (o *Options) AddFlags(fs *pflag.FlagSet) {
@@ -89,6 +93,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.Int64Var(&o.Ceph.PopulatorBufferSize, "populator-buffer-size", o.Ceph.PopulatorBufferSize, "Defines the buffer size (in bytes) which is used for downloading a image.")
 
 	fs.Int64Var(&o.Ceph.TrashRetention, "trash-retention", o.Ceph.TrashRetention, "Defines the days that an image should be kept in trash before being entirely deleted.")
+	fs.IntVar(&o.Ceph.WorkerSize, "worker-size", o.Ceph.WorkerSize, "Defines the factor to calculate the burst limits.")
 
 	fs.StringVar(&o.Ceph.Monitors, "ceph-monitors", o.Ceph.Monitors, "Ceph Monitors to connect to.")
 	fs.DurationVar(&o.Ceph.ConnectTimeout, "ceph-connect-timeout", o.Ceph.ConnectTimeout, "Connect timeout for establishing a connection to ceph.")
@@ -263,6 +268,7 @@ func Run(ctx context.Context, opts Options) error {
 			Client:         opts.Ceph.Client,
 			Pool:           opts.Ceph.Pool,
 			TrashRetention: opts.Ceph.TrashRetention,
+			WorkerSize:     opts.Ceph.WorkerSize,
 		},
 	)
 	if err != nil {

@@ -29,17 +29,18 @@ import (
 	librbd "github.com/ceph/go-ceph/rbd"
 	"github.com/containerd/containerd/reference"
 	"github.com/go-logr/logr"
+	"github.com/onmetal/onmetal-api/broker/common/idgen"
+	"github.com/onmetal/onmetal-image/oci/image"
+	"golang.org/x/exp/slices"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/utils/pointer"
+
 	"github.com/onmetal/cephlet/pkg/api"
 	"github.com/onmetal/cephlet/pkg/encryption"
 	"github.com/onmetal/cephlet/pkg/event"
 	"github.com/onmetal/cephlet/pkg/round"
 	"github.com/onmetal/cephlet/pkg/store"
 	"github.com/onmetal/cephlet/pkg/utils"
-	"github.com/onmetal/onmetal-api/broker/common/idgen"
-	"github.com/onmetal/onmetal-image/oci/image"
-	"golang.org/x/exp/slices"
-	"k8s.io/client-go/util/workqueue"
-	"k8s.io/utils/pointer"
 )
 
 const (
@@ -52,6 +53,7 @@ type ImageReconcilerOptions struct {
 	Client         string
 	Pool           string
 	TrashRetention int64
+	WorkerSize     int
 }
 
 func NewImageReconciler(
@@ -109,6 +111,10 @@ func NewImageReconciler(
 		opts.TrashRetention = 7
 	}
 
+	if opts.WorkerSize == 0 {
+		opts.WorkerSize = 64
+	}
+
 	return &ImageReconciler{
 		log:            log,
 		conn:           conn,
@@ -123,6 +129,7 @@ func NewImageReconciler(
 		client:         opts.Client,
 		pool:           opts.Pool,
 		trashRetention: opts.TrashRetention,
+		workerSize:     opts.WorkerSize,
 		keyEncryption:  keyEncryption,
 	}, nil
 }
@@ -146,6 +153,7 @@ type ImageReconciler struct {
 	client         string
 	pool           string
 	trashRetention int64
+	workerSize     int
 
 	keyEncryption encryption.Encryptor
 }
@@ -153,10 +161,7 @@ type ImageReconciler struct {
 func (r *ImageReconciler) Start(ctx context.Context) error {
 	log := r.log
 
-	//todo make configurable
-	workerSize := 15
-
-	log.Info("Starting ImageReconciler", "workerSize", workerSize, "trashRetention", r.trashRetention)
+	log.Info("Starting ImageReconciler", "workerSize", r.workerSize, "trashRetention", r.trashRetention)
 
 	imgEventReg, err := r.imageEvents.AddHandler(event.HandlerFunc[*api.Image](func(evt event.Event[*api.Image]) {
 		r.queue.Add(evt.Object.ID)
@@ -198,7 +203,7 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 	}()
 
 	var wg sync.WaitGroup
-	for i := 0; i < workerSize; i++ {
+	for i := 0; i < r.workerSize; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

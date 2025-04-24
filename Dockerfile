@@ -1,6 +1,8 @@
 # Build the manager binary
 FROM golang:1.21.4-bookworm as builder
 
+RUN apt update  && apt install -y golang git
+
 WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
@@ -65,44 +67,17 @@ ENV LIB_DIR_PREFIX_MINUS aarch64
 FROM busybox:1.36.1-uclibc as busybox
 FROM distroless-$TARGETARCH  as cephlet-volume
 WORKDIR /
-COPY --from=busybox /bin/sh /bin/sh
-COPY --from=busybox /bin/mkdir /bin/mkdir
-COPY --from=cephlet-volume-builder /lib/${LIB_DIR_PREFIX}-linux-gnu/librados.so.2 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/librbd.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libc.so.6 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libfmt.so.9 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libstdc++.so.6 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libgcc_s.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libssl.so.3 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libcryptsetup.so.12 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libcrypto.so.3 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libresolv.so.2 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libboost_thread.so.1.74.0 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libboost_iostreams.so.1.74.0 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libblkid.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libudev.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libibverbs.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/librdmacm.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libm.so.6 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libuuid.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libdevmapper.so.1.02.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libargon2.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libjson-c.so.5 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libz.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libbz2.so.1.0 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/liblzma.so.5 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libzstd.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libnl-route-3.so.200 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libnl-3.so.200 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libselinux.so.1 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libpthread.so.0 \
-/lib/${LIB_DIR_PREFIX}-linux-gnu/libpcre2-8.so.0 /lib/${LIB_DIR_PREFIX}-linux-gnu
-RUN mkdir -p /lib64
-COPY --from=cephlet-volume-builder /lib64/ld-linux-${LIB_DIR_PREFIX_MINUS}.so.2 /lib64/
-RUN mkdir -p /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/ceph/
-COPY --from=cephlet-volume-builder /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/ceph/libceph-common.so.2 /usr/lib/${LIB_DIR_PREFIX}-linux-gnu/ceph
-
 COPY --from=cephlet-volume-builder /workspace/bin/cephlet-volume /cephlet-volume
+USER 65532:65532
+ENTRYPOINT ["/cephlet-volume"]
+
+
+FROM debian:trixie AS cephlet-bucket
+RUN apt update  && apt install -y --no-install-recommends libcephfs-dev librbd-dev librados-dev libc-bin ca-certificates
+WORKDIR /
+COPY --from=cephlet-bucket-builder /workspace/bin/cephlet-bucket /cephlet-bucket
+USER 65532:65532
+ENTRYPOINT ["/cephlet-bucket"]
 
 # Build stage used for validation of the output-image
 # See validate-container-linux-* targets in Makefile

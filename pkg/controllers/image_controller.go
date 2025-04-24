@@ -30,6 +30,7 @@ import (
 	"github.com/onmetal/cephlet/pkg/api"
 	"github.com/onmetal/cephlet/pkg/encryption"
 	"github.com/onmetal/cephlet/pkg/event"
+	"github.com/onmetal/cephlet/pkg/metrics"
 	"github.com/onmetal/cephlet/pkg/round"
 	"github.com/onmetal/cephlet/pkg/store"
 	"github.com/onmetal/cephlet/pkg/utils"
@@ -43,6 +44,8 @@ const (
 	LimitMetadataPrefix = "conf_"
 	WWNKey              = "wwn"
 	imageDigestLabel    = "image-digest"
+
+	ImageReconcilerName = "image-reconciler"
 )
 
 type ImageReconcilerOptions struct {
@@ -106,7 +109,7 @@ func NewImageReconciler(
 		log:            log,
 		conn:           conn,
 		registry:       registry,
-		queue:          workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		queue:          queue,
 		images:         images,
 		snapshots:      snapshots,
 		imageEvents:    imageEvents,
@@ -115,6 +118,10 @@ func NewImageReconciler(
 		client:         opts.Client,
 		pool:           opts.Pool,
 		keyEncryption:  keyEncryption,
+
+		metricsReconcileDuration:                metrics.ControllerRuntimeReconcileDuration.With(labels),
+		metricsControllerRuntimeActiveWorker:    metrics.ControllerRuntimeActiveWorker.With(labels),
+		metricsControllerRuntimeReconcileErrors: metrics.ControllerRuntimeReconcileErrors.With(labels),
 	}, nil
 }
 
@@ -136,6 +143,10 @@ type ImageReconciler struct {
 	pool     string
 
 	keyEncryption encryption.Encryptor
+
+	metricsReconcileDuration                prometheus.Observer
+	metricsControllerRuntimeActiveWorker    prometheus.Gauge
+	metricsControllerRuntimeReconcileErrors prometheus.Counter
 }
 
 func (r *ImageReconciler) Start(ctx context.Context) error {
@@ -143,6 +154,10 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 
 	//todo make configurable
 	workerSize := 15
+
+	labels := prometheus.Labels{metrics.LabelController: ImageReconcilerName}
+	metricsMaxConcurrentReconcile := metrics.ControllerRuntimeMaxConcurrentReconciles.With(labels)
+	metricsMaxConcurrentReconcile.Set(float64(r.workerSize))
 
 	imgEventReg, err := r.imageEvents.AddHandler(event.HandlerFunc[*api.Image](func(evt event.Event[*api.Image]) {
 		r.queue.Add(evt.Object.ID)
@@ -204,13 +219,22 @@ func (r *ImageReconciler) processNextWorkItem(ctx context.Context, log logr.Logg
 	}
 	defer r.queue.Done(item)
 
+	r.metricsControllerRuntimeActiveWorker.Inc()
+	defer r.metricsControllerRuntimeActiveWorker.Dec()
+
 	id := item.(string)
 	log = log.WithValues("imageId", id)
 	ctx = logr.NewContext(ctx, log)
 
+	startTime := time.Now()
+	defer func() {
+		r.metricsReconcileDuration.Observe(float64(time.Since(startTime).Milliseconds()) / 1000)
+	}()
+
 	if err := r.reconcileImage(ctx, id); err != nil {
 		log.Error(err, "failed to reconcile image")
 		r.queue.AddRateLimited(item)
+		r.metricsControllerRuntimeReconcileErrors.Inc()
 		return true
 	}
 
@@ -247,6 +271,7 @@ type fetchAuthResponse struct {
 }
 
 func (r *ImageReconciler) fetchAuth(ctx context.Context, log logr.Logger) (string, string, error) {
+	log.V(1).Info("get authorization data")
 	cmd1, err := json.Marshal(map[string]string{
 		"prefix": "auth get-key",
 		"entity": r.client,
@@ -321,19 +346,20 @@ func (r *ImageReconciler) reconcileSnapshot(ctx context.Context, log logr.Logger
 	return nil
 }
 
-func (r *ImageReconciler) isImageExisting(ctx context.Context, log logr.Logger, ioCtx *rados.IOContext, image *api.Image) (bool, error) {
-	images, err := librbd.GetImageNames(ioCtx)
+func (r *ImageReconciler) isImageExisting(ioCtx *rados.IOContext, image *api.Image) (bool, error) {
+	rbdImg, err := librbd.OpenImage(ioCtx, ImageIDToRBDID(image.ID), librbd.NoSnapshot)
 	if err != nil {
-		return false, fmt.Errorf("failed to list images: %w", err)
-	}
-
-	for _, img := range images {
-		if ImageIDToRBDID(image.ID) == img {
-			return true, nil
+		if errors.Is(err, librbd.ErrNotFound) {
+			return false, nil
+		} else {
+			return false, err
 		}
 	}
+	if rbdImg != nil {
+		defer rbdImg.Close()
+	}
 
-	return false, nil
+	return true, nil
 }
 
 func (r *ImageReconciler) updateImage(ctx context.Context, log logr.Logger, ioCtx *rados.IOContext, image *api.Image) (err error) {
@@ -373,14 +399,19 @@ func (r *ImageReconciler) updateImage(ctx context.Context, log logr.Logger, ioCt
 
 func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 	log := logr.FromContextOrDiscard(ctx)
+	log.V(1).Info("starting reconcilation of image")
+
 	ioCtx, err := r.conn.OpenIOContext(r.pool)
 	if err != nil {
 		return fmt.Errorf("unable to get io context: %w", err)
 	}
 	defer ioCtx.Destroy()
+	log.V(1).Info("rados context created")
 
+	log.V(1).Info("getting image from the store context created")
 	img, err := r.images.Get(ctx, id)
 	if err != nil {
+		log.V(1).Info("image wasn't loaded")
 		if !errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("failed to fetch image from store: %w", err)
 		}
@@ -388,6 +419,7 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 	}
 
 	if img.DeletedAt != nil {
+		log.V(1).Info("deleting image")
 		if err := r.deleteImage(ctx, log, ioCtx, img); err != nil {
 			return fmt.Errorf("failed to delete image: %w", err)
 		}
@@ -395,7 +427,9 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 		return nil
 	}
 
+	log.V(1).Info("checking finalizer")
 	if !slices.Contains(img.Finalizers, ImageFinalizer) {
+		log.V(1).Info("adding finalizer")
 		img.Finalizers = append(img.Finalizers, ImageFinalizer)
 		if _, err := r.images.Update(ctx, img); err != nil {
 			return fmt.Errorf("failed to set finalizers: %w", err)
@@ -403,26 +437,32 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 		return nil
 	}
 
+	log.V(1).Info("reconciling snapshot")
 	if err := r.reconcileSnapshot(ctx, log, img); err != nil {
 		return fmt.Errorf("failed to reconcile snapshot: %w", err)
 	}
 
-	imageExists, err := r.isImageExisting(ctx, log, ioCtx, img)
+	log.V(1).Info("checking image existence")
+	imageExists, err := r.isImageExisting(ioCtx, img)
 	if err != nil {
 		return fmt.Errorf("failed to check image existence: %w", err)
 	}
 	log.V(1).Info("Checked image existence", "imageExists", imageExists)
 
 	if imageExists {
+		log.V(1).Info("image exists")
 		if img.Status.State == api.ImageStateAvailable {
+			log.V(1).Info("updating (resize)")
 			if err := r.updateImage(ctx, log, ioCtx, img); err != nil {
 				return fmt.Errorf("failed to update image: %w", err)
 			}
 			return nil
 		}
 	} else {
+		log.V(1).Info("image creating")
 		options := librbd.NewRbdImageOptions()
 		defer options.Destroy()
+		log.V(1).Info("set rados image option")
 		if err := options.SetString(librbd.RbdImageOptionDataPool, r.pool); err != nil {
 			return fmt.Errorf("failed to set data pool: %w", err)
 		}
@@ -465,6 +505,7 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 		return fmt.Errorf("failed to fetch credentials: %w", err)
 	}
 
+	log.V(1).Info("updating image status")
 	img.Status.Access = &api.ImageAccess{
 		Monitors: r.monitors,
 		Handle:   fmt.Sprintf("%s/%s", r.pool, ImageIDToRBDID(img.ID)),
@@ -482,6 +523,7 @@ func (r *ImageReconciler) reconcileImage(ctx context.Context, id string) error {
 }
 
 func (r *ImageReconciler) setImageLimits(ctx context.Context, log logr.Logger, ioCtx *rados.IOContext, image *api.Image) error {
+	log.V(1).Info("set limits")
 	if len(image.Spec.Limits) <= 0 {
 		return nil
 	}
@@ -532,6 +574,7 @@ func (r *ImageReconciler) setWWN(ctx context.Context, log logr.Logger, ioCtx *ra
 }
 
 func (r *ImageReconciler) setEncryptionHeader(ctx context.Context, log logr.Logger, ioCtx *rados.IOContext, image *api.Image) error {
+	log.V(1).Info("set encryption header")
 	if image.Spec.Encryption.Type == "" || image.Spec.Encryption.Type == api.EncryptionTypeUnencrypted || image.Status.Encryption == api.EncryptionStateHeaderSet {
 		return nil
 	}

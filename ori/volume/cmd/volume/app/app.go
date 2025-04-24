@@ -16,9 +16,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	goflag "flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"github.com/onmetal/cephlet/pkg/controllers"
 	"github.com/onmetal/cephlet/pkg/encryption"
 	"github.com/onmetal/cephlet/pkg/event"
+	"github.com/onmetal/cephlet/pkg/metrics"
 	"github.com/onmetal/cephlet/pkg/omap"
 	"github.com/onmetal/cephlet/pkg/utils"
 	"github.com/onmetal/cephlet/pkg/vcr"
@@ -44,6 +47,8 @@ import (
 
 type Options struct {
 	Address string
+
+	MetricsServerAddress string
 
 	PathSupportedVolumeClasses string
 
@@ -93,6 +98,8 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.Ceph.Pool, "ceph-pool", o.Ceph.Pool, "Ceph pool which is used to store objects.")
 	fs.StringVar(&o.Ceph.Client, "ceph-client", o.Ceph.Client, "Ceph client which grants access to pools/images eg. 'client.volumes'")
 	fs.StringVar(&o.Ceph.KeyEncryptionKeyPath, "ceph-kek-path", o.Ceph.KeyEncryptionKeyPath, "path to the key encryption key file (32 Bit - KEK) to encrypt volume keys.")
+
+	fs.StringVar(&o.MetricsServerAddress, "metrics-server-addr", o.MetricsServerAddress, "metrics server address. If it isn't set, server is disabled.")
 }
 
 func (o *Options) MarkFlagsRequired(cmd *cobra.Command) {
@@ -202,8 +209,14 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("configuration invalid: %w", err)
 	}
 
+	// Wrap the concrete connection to satisfy the interface
+	radosConnWrapper := omap.NewCephRadosConnection(conn)
+	if radosConnWrapper == nil {
+		return fmt.Errorf("failed to create rados connection wrapper")
+	}
+
 	setupLog.Info("Configuring image store", "OmapName", omap.OmapNameVolumes)
-	imageStore, err := omap.New(conn, opts.Ceph.Pool, omap.Options[*api.Image]{
+	imageStore, err := omap.New(radosConnWrapper, opts.Ceph.Pool, log.WithName("image-store"), omap.Options[*api.Image]{
 		OmapName:       omap.OmapNameVolumes,
 		NewFunc:        func() *api.Image { return &api.Image{} },
 		CreateStrategy: utils.ImageStrategy,
@@ -222,7 +235,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	setupLog.Info("Configuring snapshot store", "OmapName", omap.OmapNameOsImages)
-	snapshotStore, err := omap.New(conn, opts.Ceph.Pool, omap.Options[*api.Snapshot]{
+	snapshotStore, err := omap.New(radosConnWrapper, opts.Ceph.Pool, log.WithName("snapshot-store"), omap.Options[*api.Snapshot]{
 		OmapName:       omap.OmapNameOsImages,
 		NewFunc:        func() *api.Snapshot { return &api.Snapshot{} },
 		CreateStrategy: utils.SnapshotStrategy,
@@ -315,6 +328,14 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := runMetricsServer(ctx, setupLog, opts.MetricsServerAddress); err != nil {
+			log.Error(err, "failed to start metrics server")
+		}
+	}()
+
 	supportedClasses, err := vcr.LoadVolumeClassesFile(opts.PathSupportedVolumeClasses)
 	if err != nil {
 		return fmt.Errorf("failed to load supported volume classes: %w", err)
@@ -387,5 +408,57 @@ func Run(ctx context.Context, opts Options) error {
 	if err := grpcSrv.Serve(l); err != nil {
 		return fmt.Errorf("error serving: %w", err)
 	}
+	return nil
+}
+
+func runMetricsServer(ctx context.Context, setupLog logr.Logger, addr string) error {
+	if addr == "" {
+		setupLog.Info("Metrics server address isn't configured. Metrics server is disabled.")
+		return nil
+	}
+
+	err := metrics.RegisterAllMetrics()
+	if err != nil {
+		return err
+	}
+
+	setupLog.Info("Starting metrics server on " + addr)
+
+	router := http.NewServeMux()
+	router.Handle("/metrics", promhttp.Handler())
+
+	srv := http.Server{
+		Addr:    addr,
+		Handler: router,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		<-ctx.Done()
+		setupLog.Info("Shutting down metrics server")
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		locErr := srv.Shutdown(shutdownCtx)
+		if locErr != nil {
+			setupLog.Error(locErr, "metrics server wasn't shutdown properly")
+		} else {
+			setupLog.Info("Metrics server is shutdown")
+		}
+	}()
+
+	err = srv.ListenAndServe()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("error listening / serving metrics server: %w", err)
+	}
+
+	setupLog.Info("Metrics server stopped serve new connections")
+
+	wg.Wait()
+
 	return nil
 }

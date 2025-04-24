@@ -27,13 +27,19 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/onmetal/cephlet/pkg/api"
 	"github.com/onmetal/cephlet/pkg/event"
+	"github.com/onmetal/cephlet/pkg/metrics"
 	"github.com/onmetal/cephlet/pkg/round"
 	"github.com/onmetal/cephlet/pkg/store"
 	"github.com/onmetal/cephlet/pkg/utils"
 	onmetalimage "github.com/onmetal/onmetal-image"
 	"github.com/onmetal/onmetal-image/oci/image"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/exp/slices"
 	"k8s.io/client-go/util/workqueue"
+)
+
+const (
+	SnapshotReconcilerName = "snapshot-reconciler"
 )
 
 type SnapshotReconcilerOptions struct {
@@ -73,15 +79,24 @@ func NewSnapshotReconciler(
 		opts.PopulatorBufferSize = 5 * 1024 * 1024
 	}
 
+	labels := prometheus.Labels{metrics.LabelController: SnapshotReconcilerName}
+
+	queue := workqueue.NewRateLimitingQueueWithConfig(
+		workqueue.DefaultControllerRateLimiter(),
+		workqueue.RateLimitingQueueConfig{Name: SnapshotReconcilerName, MetricsProvider: &metrics.WorkqueueMetricsProvider{}})
+
 	return &SnapshotReconciler{
-		log:                 log,
-		conn:                conn,
-		registry:            registry,
-		queue:               workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		store:               store,
-		events:              events,
-		pool:                opts.Pool,
-		populatorBufferSize: opts.PopulatorBufferSize,
+		log:                                     log,
+		conn:                                    conn,
+		registry:                                registry,
+		queue:                                   queue,
+		store:                                   store,
+		events:                                  events,
+		pool:                                    opts.Pool,
+		populatorBufferSize:                     opts.PopulatorBufferSize,
+		metricsReconcileDuration:                metrics.ControllerRuntimeReconcileDuration.With(labels),
+		metricsControllerRuntimeActiveWorker:    metrics.ControllerRuntimeActiveWorker.With(labels),
+		metricsControllerRuntimeReconcileErrors: metrics.ControllerRuntimeReconcileErrors.With(labels),
 	}, nil
 }
 
@@ -97,6 +112,10 @@ type SnapshotReconciler struct {
 
 	pool                string
 	populatorBufferSize int64
+
+	metricsReconcileDuration                prometheus.Observer
+	metricsControllerRuntimeActiveWorker    prometheus.Gauge
+	metricsControllerRuntimeReconcileErrors prometheus.Counter
 }
 
 func (r *SnapshotReconciler) openSnapshotSource(ctx context.Context, src api.SnapshotSource) (io.ReadCloser, uint64, string, error) {
@@ -135,6 +154,10 @@ func (r *SnapshotReconciler) Start(ctx context.Context) error {
 	//todo make configurable
 	workerSize := 15
 
+	labels := prometheus.Labels{metrics.LabelController: SnapshotReconcilerName}
+	metricsMaxConcurrentReconcile := metrics.ControllerRuntimeMaxConcurrentReconciles.With(labels)
+	metricsMaxConcurrentReconcile.Set(float64(workerSize))
+
 	reg, err := r.events.AddHandler(event.HandlerFunc[*api.Snapshot](func(event event.Event[*api.Snapshot]) {
 		r.queue.Add(event.Object.ID)
 	}))
@@ -171,13 +194,22 @@ func (r *SnapshotReconciler) processNextWorkItem(ctx context.Context, log logr.L
 	}
 	defer r.queue.Done(item)
 
+	r.metricsControllerRuntimeActiveWorker.Inc()
+	defer r.metricsControllerRuntimeActiveWorker.Dec()
+
 	id := item.(string)
 	log = log.WithValues("snapshotId", id)
 	ctx = logr.NewContext(ctx, log)
 
+	startTime := time.Now()
+	defer func() {
+		r.metricsReconcileDuration.Observe(float64(time.Since(startTime).Milliseconds()) / 1000)
+	}()
+
 	if err := r.reconcileSnapshot(ctx, id); err != nil {
 		log.Error(err, "failed to reconcile snapshot")
 		r.queue.AddRateLimited(item)
+		r.metricsControllerRuntimeReconcileErrors.Inc()
 		return true
 	}
 
@@ -279,6 +311,8 @@ func (r *SnapshotReconciler) deleteSnapshot(ctx context.Context, log logr.Logger
 
 func (r *SnapshotReconciler) reconcileSnapshot(ctx context.Context, id string) error {
 	log := logr.FromContextOrDiscard(ctx)
+	log.V(1).Info("starting reconcilation of snapshot")
+
 	ioCtx, err := r.conn.OpenIOContext(r.pool)
 	if err != nil {
 		return fmt.Errorf("unable to get io context: %w", err)

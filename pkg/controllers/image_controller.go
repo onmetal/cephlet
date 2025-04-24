@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ceph/go-ceph/rados"
 	librbd "github.com/ceph/go-ceph/rbd"
@@ -105,11 +107,28 @@ func NewImageReconciler(
 		return nil, fmt.Errorf("must specify ceph client")
 	}
 
+	if opts.TrashRetention == 0 {
+		opts.TrashRetention = 7
+	}
+
+	if opts.WorkerSize == 0 {
+		opts.WorkerSize = 64
+	}
+
+	labels := prometheus.Labels{metrics.LabelController: ImageReconcilerName}
+
+	queue := workqueue.NewRateLimitingQueueWithConfig(workqueue.DefaultControllerRateLimiter(),
+		workqueue.RateLimitingQueueConfig{Name: ImageReconcilerName, MetricsProvider: &metrics.WorkqueueMetricsProvider{}})
+
+	genericQueue := workqueue.NewRateLimitingQueueWithConfig(workqueue.DefaultControllerRateLimiter(),
+		workqueue.RateLimitingQueueConfig{Name: ImageReconcilerName, MetricsProvider: &metrics.WorkqueueMetricsProvider{}})
+
 	return &ImageReconciler{
 		log:            log,
 		conn:           conn,
 		registry:       registry,
 		queue:          queue,
+		genericQueue:   genericQueue,
 		images:         images,
 		snapshots:      snapshots,
 		imageEvents:    imageEvents,
@@ -129,8 +148,11 @@ type ImageReconciler struct {
 	log  logr.Logger
 	conn *rados.Conn
 
-	registry image.Source
-	queue    workqueue.RateLimitingInterface
+	wwnGen idgen.IDGen
+
+	registry     image.Source
+	queue        workqueue.RateLimitingInterface
+	genericQueue workqueue.RateLimitingInterface
 
 	images    store.Store[*api.Image]
 	snapshots store.Store[*api.Snapshot]
@@ -143,6 +165,8 @@ type ImageReconciler struct {
 	pool     string
 
 	keyEncryption encryption.Encryptor
+
+	turnCounter atomic.Int64
 
 	metricsReconcileDuration                prometheus.Observer
 	metricsControllerRuntimeActiveWorker    prometheus.Gauge
@@ -160,7 +184,11 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 	metricsMaxConcurrentReconcile.Set(float64(r.workerSize))
 
 	imgEventReg, err := r.imageEvents.AddHandler(event.HandlerFunc[*api.Image](func(evt event.Event[*api.Image]) {
-		r.queue.Add(evt.Object.ID)
+		if evt.Type == event.TypeGeneric {
+			r.genericQueue.Add(evt.Object.ID)
+		} else {
+			r.queue.Add(evt.Object.ID)
+		}
 	}))
 	if err != nil {
 		return err
@@ -196,6 +224,7 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		r.queue.ShutDown()
+		r.genericQueue.ShutDown()
 	}()
 
 	var wg sync.WaitGroup
@@ -212,12 +241,12 @@ func (r *ImageReconciler) Start(ctx context.Context) error {
 	return nil
 }
 
-func (r *ImageReconciler) processNextWorkItem(ctx context.Context, log logr.Logger) bool {
-	item, shutdown := r.queue.Get()
+func (r *ImageReconciler) processQueueItem(ctx context.Context, log logr.Logger, queue workqueue.RateLimitingInterface) bool {
+	item, shutdown := queue.Get()
 	if shutdown {
 		return false
 	}
-	defer r.queue.Done(item)
+	defer queue.Done(item)
 
 	r.metricsControllerRuntimeActiveWorker.Inc()
 	defer r.metricsControllerRuntimeActiveWorker.Dec()
@@ -233,13 +262,64 @@ func (r *ImageReconciler) processNextWorkItem(ctx context.Context, log logr.Logg
 
 	if err := r.reconcileImage(ctx, id); err != nil {
 		log.Error(err, "failed to reconcile image")
-		r.queue.AddRateLimited(item)
+		queue.AddRateLimited(item)
 		r.metricsControllerRuntimeReconcileErrors.Inc()
 		return true
 	}
 
-	r.queue.Forget(item)
+	queue.Forget(item)
 	return true
+}
+
+func (r *ImageReconciler) processNextWorkItem(ctx context.Context, log logr.Logger) bool {
+	turn := r.turnCounter.Add(1)
+
+	var preferredQueue, fallbackQueue workqueue.RateLimitingInterface
+	var preferredName, fallbackName string
+
+	if turn&1 == 0 { // Even turn
+		preferredQueue = r.queue
+		fallbackQueue = r.genericQueue
+		preferredName = "priority"
+		fallbackName = "generic"
+	} else { // Odd turn
+		preferredQueue = r.genericQueue
+		fallbackQueue = r.queue
+		preferredName = "generic"
+		fallbackName = "priority"
+	}
+
+	log.V(1).Info("Determined queue preference", "preferredQueue", preferredName, "turn", turn)
+	// 1. Try Preferred Queue
+	if preferredQueue.Len() > 0 {
+		log.V(1).Info("Attempting preferred queue (quick check positive)") // Log decision step
+
+		plog := log.WithValues("actionQueue", preferredName)
+		processed := r.processQueueItem(ctx, plog, preferredQueue)
+
+		// If processed successfully OR the queue is shutting down, return
+		if processed || preferredQueue.ShuttingDown() {
+			return processed
+		}
+		// Log if the attempt didn't lead to completion (e.g., Get returned shutdown)
+		log.V(1).Info("Preferred queue attempt did not complete processing, trying fallback")
+	}
+
+	// 2. Try Fallback Queue
+	if fallbackQueue.Len() > 0 {
+		log.V(1).Info("Attempting fallback queue (quick check positive)") // Log decision step
+
+		flog := log.WithValues("actionQueue", fallbackName)
+		return r.processQueueItem(ctx, flog, fallbackQueue)
+		// Return directly, as this is the second and last attempt based on Len() checks
+	}
+
+	// 3. Block on Preferred Queue
+	// This happens if both Len() checks were 0, OR if the preferred attempt failed cleanly.
+	log.V(1).Info("Both queues seemed empty or preferred attempt failed, blocking on preferred queue") // Log decision step
+
+	blog := log.WithValues("actionQueue", preferredName) // Context shows we are *acting* on preferred queue
+	return r.processQueueItem(ctx, blog, preferredQueue)
 }
 
 const (

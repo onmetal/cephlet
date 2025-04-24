@@ -21,10 +21,11 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/onmetal/cephlet/pkg/api"
-	"github.com/onmetal/cephlet/pkg/store"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/onmetal/cephlet/pkg/api"
+	"github.com/onmetal/cephlet/pkg/store"
 )
 
 type Handler[E api.Object] interface {

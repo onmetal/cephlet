@@ -174,6 +174,13 @@ func configureCephAuth(opts *CephOptions) (func() error, error) {
 func Run(ctx context.Context, opts Options) error {
 	log := ctrl.LoggerFrom(ctx)
 	setupLog := log.WithName("setup")
+
+	if opts.Ceph.WorkerSize <= 1 {
+		err := fmt.Errorf("invalid configuration: worker-size must be greater than 1, but got %d", opts.Ceph.WorkerSize)
+		setupLog.Error(err, "Worker size validation failed")
+		return err
+	}
+
 	var wg sync.WaitGroup
 
 	cleanup, err := configureCephAuth(&opts.Ceph)
